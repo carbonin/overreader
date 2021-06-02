@@ -1,3 +1,5 @@
+[![Go](https://github.com/carbonin/overreader/actions/workflows/go.yml/badge.svg)](https://github.com/carbonin/overreader/actions/workflows/go.yml)
+
 # overreader
 
 Implements a single reader which handles replacing multiple ranges in an underlying reader with separate data.
