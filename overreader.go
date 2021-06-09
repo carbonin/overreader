@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math"
 	"sort"
 )
 
@@ -12,13 +11,6 @@ type Range struct {
 	Content io.ReadSeeker
 	Offset  int64
 	length  int64
-}
-
-func (r *Range) locationInRange(location int64) bool {
-	if location >= r.Offset && location <= r.Offset+r.length {
-		return true
-	}
-	return false
 }
 
 func (r *Range) setLength() error {
@@ -61,19 +53,26 @@ func (s rangeSlice) valid() error {
 	return nil
 }
 
-type Reader struct {
-	base   io.Reader
-	ranges rangeSlice
-
-	// location for the next read in the base reader
-	location int64
-	// current range index to read from (if the location is in the range)
-	currentRangeIndex int
+type skipReader struct {
+	reader io.Reader
 }
 
-var _ io.Reader = &Reader{}
+func newSkipReader(reader io.Reader) *skipReader {
+	return &skipReader{reader: reader}
+}
 
-func NewReader(baseReader io.Reader, overrideRanges ...*Range) (*Reader, error) {
+var _ io.Reader = &skipReader{}
+
+func (sr *skipReader) Read(p []byte) (int, error) {
+	_, err := io.Copy(ioutil.Discard, sr.reader)
+	if err == nil {
+		err = io.EOF
+	}
+
+	return 0, err
+}
+
+func NewReader(baseReader io.Reader, overrideRanges ...*Range) (io.Reader, error) {
 	ranges := rangeSlice(overrideRanges)
 	for _, r := range ranges {
 		if err := r.setLength(); err != nil {
@@ -86,68 +85,14 @@ func NewReader(baseReader io.Reader, overrideRanges ...*Range) (*Reader, error) 
 		return nil, err
 	}
 
-	return &Reader{
-		base:   baseReader,
-		ranges: ranges,
-	}, nil
-}
-
-func (r *Reader) Read(p []byte) (int, error) {
-	// does the current range reader include the current location?
-	if r.readFromOverrideRange() {
-		count, err := r.currentRange().Content.Read(p)
-
-		// increment the underlying reader by count
-		skipped, copyErr := io.CopyN(ioutil.Discard, r.base, int64(count))
-
-		if err != nil && err != io.EOF {
-			return count, err
-		} else if err == io.EOF {
-			// increment to the next range if we've reached the end of this one
-			r.currentRangeIndex++
-		}
-
-		// Fail if we can't track the base reader with the override reader
-		if copyErr != nil && copyErr != io.EOF {
-			return count, fmt.Errorf("failed to advance underlying reader: %w", copyErr)
-		}
-		if skipped != int64(count) && copyErr != io.EOF {
-			return count, fmt.Errorf("failed to advance underlying reader the correct number of bytes: expected %d, got %d", count, skipped)
-		}
-
-		r.location += int64(count)
-		return count, nil
+	var loc int64
+	readers := make([]io.Reader, 0)
+	for _, r := range ranges {
+		limit := r.Offset - loc
+		readers = append(readers, io.LimitReader(baseReader, limit), r.Content, newSkipReader(io.LimitReader(baseReader, r.length)))
+		loc += limit + r.length
 	}
+	readers = append(readers, baseReader)
 
-	readBuf := p
-	// if we have more ranges, don't read more than the distance to the next one
-	if r.haveMoreRanges() && int64(len(p)) > r.currentRangeDistance() {
-		readBuf = p[0:r.currentRangeDistance()]
-	}
-
-	count, err := r.base.Read(readBuf)
-	r.location += int64(count)
-	return count, err
-}
-
-func (r *Reader) readFromOverrideRange() bool {
-	if !r.haveMoreRanges() {
-		return false
-	}
-	return r.currentRange().locationInRange(r.location)
-}
-
-func (r *Reader) currentRange() *Range {
-	return r.ranges[r.currentRangeIndex]
-}
-
-func (r *Reader) currentRangeDistance() int64 {
-	if !r.haveMoreRanges() {
-		return math.MaxInt64
-	}
-	return r.currentRange().Offset - r.location
-}
-
-func (r *Reader) haveMoreRanges() bool {
-	return r.currentRangeIndex < len(r.ranges)
+	return io.MultiReader(readers...), nil
 }
